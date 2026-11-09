@@ -1,0 +1,435 @@
+
+import arcpy
+import math
+import os
+import csv
+import traceback
+
+from arcpy.sa import ExtractMultiValuesToPoints
+
+# ============================================================
+# 1. INPUTS
+# ============================================================
+
+sites = r"C:\Users\ahzami\OneDrive - Hamad bin Khalifa University\Documents\thermal data\Data cooling clip"
+
+raster = r"C:\Users\ahzami\OneDrive - Hamad bin Khalifa University\Documents\ArcGIS\Projects\Thermal selection sites\Thermal selection sites.gdb\RasterC_1"
+
+workspace = r"C:\Users\ahzami\OneDrive - Hamad bin Khalifa University\Documents\ArcGIS\Projects\Thermal selection sites\Thermal selection sites.gdb"
+
+zone_field = "ZoneID"
+
+# ============================================================
+# 2. PARAMETERS
+# ============================================================
+
+half_length = 1000       # 1000 m on each side
+sampling_distance = 30   # Landsat spatial resolution
+
+profile_angles = {
+    "EW": 0,
+    "NS": 90,
+    "NE_SW": 45,
+    "NW_SE": 135
+}
+
+# ============================================================
+# 3. OUTPUTS
+# ============================================================
+
+arcpy.env.workspace = workspace
+arcpy.env.overwriteOutput = True
+
+representative_fc = os.path.join(
+    workspace, "Step1_RepresentativePoints"
+)
+
+profiles_fc = os.path.join(
+    workspace, "Step2_ThermalProfiles"
+)
+
+points_fc = os.path.join(
+    workspace, "Step3_ProfilePoints_LST"
+)
+
+csv_folder = os.path.join(
+    os.path.dirname(workspace),
+    "ThermalProfiles_CSV"
+)
+
+os.makedirs(csv_folder, exist_ok=True)
+
+# ============================================================
+# 4. CHECK INPUTS
+# ============================================================
+
+print("\nChecking input datasets...")
+
+if not arcpy.Exists(sites):
+    raise Exception(
+        "Sites dataset not found. Check the path. "
+        "If it is a shapefile, include its .shp extension."
+    )
+
+if not arcpy.Exists(raster):
+    raise Exception("LST raster not found.")
+
+if not arcpy.Exists(workspace):
+    raise Exception("Output geodatabase not found.")
+
+if zone_field not in [f.name for f in arcpy.ListFields(sites)]:
+    raise Exception("ZoneID field not found in sites.")
+
+sr = arcpy.Describe(sites).spatialReference
+
+if sr.type != "Projected":
+    raise Exception(
+        "The input polygons must use a projected coordinate system."
+    )
+
+if "meter" not in sr.linearUnitName.lower():
+    raise Exception(
+        "The input coordinate system must use metres. "
+        "Project the polygons to a suitable metric CRS first."
+    )
+
+# ============================================================
+# 5. DELETE PREVIOUS OUTPUTS
+# ============================================================
+
+print("Cleaning previous outputs...")
+
+for fc in [representative_fc, profiles_fc, points_fc]:
+
+    if arcpy.Exists(fc):
+        arcpy.management.Delete(fc)
+
+# ============================================================
+# 6. CREATE REPRESENTATIVE POINTS
+# ============================================================
+
+print("\nCreating representative points...")
+
+arcpy.management.FeatureToPoint(
+    sites,
+    representative_fc,
+    "INSIDE"
+)
+
+site_count = int(
+    arcpy.management.GetCount(representative_fc)[0]
+)
+
+print("Selected sites:", site_count)
+
+# ============================================================
+# 7. CREATE PROFILE FEATURE CLASS
+# ============================================================
+
+print("\nCreating four directional profiles...")
+
+arcpy.management.CreateFeatureclass(
+    workspace,
+    "Step2_ThermalProfiles",
+    "POLYLINE",
+    spatial_reference=sr
+)
+
+zone_type = next(
+    f.type for f in arcpy.ListFields(sites)
+    if f.name == zone_field
+)
+
+zone_field_type = {
+    "String": "TEXT",
+    "Integer": "LONG",
+    "SmallInteger": "SHORT",
+    "Double": "DOUBLE",
+    "Single": "FLOAT"
+}.get(zone_type)
+
+if zone_field_type is None:
+    raise Exception("Unsupported ZoneID field type.")
+
+arcpy.management.AddField(
+    profiles_fc, "ZoneID", zone_field_type
+)
+
+arcpy.management.AddField(
+    profiles_fc, "Direction", "TEXT",
+    field_length=10
+)
+
+arcpy.management.AddField(
+    profiles_fc, "Length_m", "DOUBLE"
+)
+
+# ============================================================
+# 8. PREPARE SAMPLING DISTANCES
+# ============================================================
+
+distances = list(
+    range(-half_length, half_length + 1, sampling_distance)
+)
+
+# Include exact end point if it is not already present.
+if distances[-1] != half_length:
+    distances.append(half_length)
+
+print("Sampling positions per profile:", len(distances))
+
+# ============================================================
+# 9. CREATE PROFILES AND PROFILE POINTS
+# ============================================================
+
+print("\nGenerating profiles and sample points...")
+
+arcpy.management.CreateFeatureclass(
+    workspace,
+    "Step3_ProfilePoints_LST",
+    "POINT",
+    spatial_reference=sr
+)
+
+arcpy.management.AddField(
+    points_fc, "ZoneID", zone_field_type
+)
+
+arcpy.management.AddField(
+    points_fc, "Direction", "TEXT",
+    field_length=10
+)
+
+arcpy.management.AddField(
+    points_fc, "Distance_m", "DOUBLE"
+)
+
+arcpy.management.AddField(
+    points_fc, "PointNo", "LONG"
+)
+
+profile_fields = [
+    "SHAPE@", "ZoneID", "Direction", "Length_m"
+]
+
+point_fields = [
+    "SHAPE@", "ZoneID", "Direction",
+    "Distance_m", "PointNo"
+]
+
+profile_number = 0
+point_number = 0
+
+with arcpy.da.SearchCursor(
+    representative_fc,
+    ["SHAPE@", zone_field]
+) as scur, \
+     arcpy.da.InsertCursor(
+         profiles_fc, profile_fields
+     ) as line_cursor, \
+     arcpy.da.InsertCursor(
+         points_fc, point_fields
+     ) as point_cursor:
+
+    for shape, zoneid in scur:
+
+        center = shape.centroid
+
+        x = center.X
+        y = center.Y
+
+        for direction, angle in profile_angles.items():
+
+            theta = math.radians(angle)
+
+            # Create profile endpoints
+            dx = half_length * math.cos(theta)
+            dy = half_length * math.sin(theta)
+
+            start = arcpy.Point(
+                x - dx, y - dy
+            )
+
+            end = arcpy.Point(
+                x + dx, y + dy
+            )
+
+            line = arcpy.Polyline(
+                arcpy.Array([start, end]),
+                sr
+            )
+
+            line_cursor.insertRow([
+                line,
+                zoneid,
+                direction,
+                line.length
+            ])
+
+            profile_number += 1
+
+            # Generate points along this profile
+            for i, distance in enumerate(distances):
+
+                px = x + distance * math.cos(theta)
+                py = y + distance * math.sin(theta)
+
+                point = arcpy.PointGeometry(
+                    arcpy.Point(px, py),
+                    sr
+                )
+
+                point_cursor.insertRow([
+                    point,
+                    zoneid,
+                    direction,
+                    float(distance),
+                    i + 1
+                ])
+
+                point_number += 1
+
+        print("Processed ZoneID:", zoneid)
+
+print("\nProfiles created:", profile_number)
+print("Sampling points created:", point_number)
+
+# ============================================================
+# 10. EXTRACT LANDSAT LST
+# ============================================================
+
+print("\nExtracting Landsat LST values...")
+
+arcpy.CheckOutExtension("Spatial")
+
+try:
+
+    ExtractMultiValuesToPoints(
+        points_fc,
+        [[raster, "LST"]],
+        "NONE"
+    )
+
+finally:
+
+    arcpy.CheckInExtension("Spatial")
+
+# ============================================================
+# 11. ADD XY COORDINATES
+# ============================================================
+
+print("\nCalculating coordinates...")
+
+arcpy.management.AddXY(points_fc)
+
+# ============================================================
+# 12. EXPORT INDIVIDUAL CSV FILES
+# ============================================================
+
+print("\nExporting individual profile CSV files...")
+
+csv_fields = [
+    "ZoneID",
+    "Direction",
+    "Distance_m",
+    "POINT_X",
+    "POINT_Y",
+    "LST"
+]
+
+grouped_profiles = {}
+
+with arcpy.da.SearchCursor(
+    points_fc,
+    csv_fields,
+    sql_clause=(None, "ORDER BY ZoneID, Direction, Distance_m")
+) as cursor:
+
+    for row in cursor:
+
+        zoneid = row[0]
+        direction = row[1]
+
+        key = (zoneid, direction)
+
+        if key not in grouped_profiles:
+            grouped_profiles[key] = []
+
+        grouped_profiles[key].append(row)
+
+# Export one file for every site and direction
+
+for (zoneid, direction), rows in grouped_profiles.items():
+
+    filename = "Site_{}_{}.csv".format(
+        zoneid, direction
+    )
+
+    filepath = os.path.join(
+        csv_folder, filename
+    )
+
+    with open(
+        filepath, "w", newline="", encoding="utf-8-sig"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(csv_fields)
+
+        writer.writerows(rows)
+
+    print("Exported:", filename)
+
+# ============================================================
+# 13. EXPORT COMBINED CSV
+# ============================================================
+
+combined_csv = os.path.join(
+    csv_folder,
+    "ALL_Thermal_Profiles.csv"
+)
+
+with open(
+    combined_csv,
+    "w", newline="", encoding="utf-8-sig"
+) as f:
+
+    writer = csv.writer(f)
+
+    writer.writerow(csv_fields)
+
+    for key in sorted(
+        grouped_profiles,
+        key=lambda k: (str(k[0]), k[1])
+    ):
+
+        writer.writerows(grouped_profiles[key])
+
+# ============================================================
+# 14. FINAL SUMMARY
+# ============================================================
+
+print("\n" + "=" * 60)
+print("THERMAL PROFILE ANALYSIS COMPLETED")
+print("=" * 60)
+
+print("Number of sites:", site_count)
+print("Number of directions:", len(profile_angles))
+print("Total profiles:", profile_number)
+print("Total sample points:", point_number)
+print("CSV files:", len(grouped_profiles))
+
+print("\nOUTPUT FEATURE CLASSES:")
+print(representative_fc)
+print(profiles_fc)
+print(points_fc)
+
+print("\nCSV OUTPUT FOLDER:")
+print(csv_folder)
+
+print("\nCOMBINED CSV:")
+print(combined_csv)
+
+print("\nProcessing completed successfully!")
+print("=" * 60)
